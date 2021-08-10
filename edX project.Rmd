@@ -1,0 +1,403 @@
+---
+title: 'Early Missed Deadline Alert with LMS Data'
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+library(tidyverse)
+# This loads 3 datasets: cl=clickstream, a=assessment grades; m=module states.
+load("data.rda")
+```
+
+# Eda 
+
+1. Clickstream data (1 row per student per action): [documentation](https://edx.readthedocs.io/projects/devdata/en/stable/internal_data_formats/tracking_logs.html#tracking-logs)
+2. Module States (1 row per student per accessed content): original name [courseware-studentmodule (doumentation)](https://edx.readthedocs.io/projects/devdata/en/stable/internal_data_formats/sql_schema.html#courseware-studentmodule)
+3. Assessment grades (1 row per assessment per student)
+
+```{r}
+# Exploring Clickstreams
+head(cl)
+# Each row represents a click action by a student. This dataset contains the following variables:
+# 1) hash_id = unique anonymized ID of the student user
+length(na.omit(cl$hash_id))
+## 122480/133821 entries are associated with a hash_id
+length(na.omit(unique(cl$hash_id)))
+## There are 95 unique student users
+length(na.omit(unique(cl[,c('hash_id','survey_id')]$hash_id)))
+# 2) survey_id = each student also receives a unique survey ID
+# 3) time = time of the click event in UTC
+# 4) name = name of the click event
+# 5) event_type = type of the click event
+length(na.omit(unique(cl[,c('name','event_type')]$name)))
+length(cl[cl$name!=cl$event_type,]$name)
+head(cl[cl$name!=cl$event_type,][c('name','event_type')])
+## Name and event type are mostly identical. Only 10521/133821 of their entries differ. In the ones that differ, event_type takes the values of seq_goto, seq_prev, or seq_next
+# 6) referrer = link to the click event
+# 7) page = link to the click event
+length(na.omit(unique(cl$referer)))
+length(na.omit(unique(cl$page)))
+length(na.omit(unique(cl[,c('referer','page')]$page)))
+table(cl[is.na(cl$page),]$event_source)
+table(cl[!is.na(cl$page),]$event_source)
+table(cl[cl$event_source=="server",]$page)
+## Certain event types may contain information in the referer and page variables with links to the click event. Page seems to be a subset of referrer and always contain the same value as referrer. Additionally, page's value seem to also depend on the event_source, as all of NA entries for page are associated with server events, and the few server events with non-NA page entries all have 'x_module' as their values
+table(cl$event_source)
+# 8) event_source: source of the event. Either 'browser' or 'server'
+unique(cl[cl$event_source=="browser",]$event_type)
+## The general difference seem to be that browser events represent actions taken by the students when interacting with modules (clicking, video movement, saving, accessing contents, uploading, etc.), while server events are actions that require linking to an external central database (login actions, processing a submission, marking modules as accessed/completed, etc.)
+# 9) event: a data structure representation of the click event
+# 10) timestamp: taking the difference between timestamp will give you the difference in seconds of the times
+
+# Exploring Module States
+head(m)
+# Each row represents a module accessed by a student
+# 1) hash_id = Same as above
+# 2) module_type = 6 different types of module
+table(m$module_type)
+# 3) grade = Received grades ranging from 1-7. Only "problem" modules have this (and some of them don't)
+unique(m[m$module_type=="problem",]$grade)
+# 4) created = time module was created in UTC, typically when the student first accesses the module
+# 5) modified = time module was modified in UTC. Set equal to created initially, and typically changes when the student interacts/save/submit the module
+# 6) max_grade = same with grade but maximum possible for the problem
+# 7) module_id = unique id of the module.
+length(na.omit(unique(m$module_id)))
+## There were 93 unique modules accessed, with no NA rows
+# 8) created_timestamp/modified_timestamp = can be used to find differences in time the same way as timestamp above
+
+# Exploring Assessment grades
+head(a)
+# Each row represents an assessment that can be attempted by a student
+# 1) hash_id = same as above
+# 2) usage_key = assessment module id
+sum(str_detect(a$usage_key,"sequential"))
+length(m[str_detect(m$module_id,"sequential"),]$module_type)
+length(setdiff(m[m$module_type=="sequential",]$module_id, a$usage_key))
+## This is a subset of module_id above that contains 3135 sequential modules. This is slightly higher than the count of 'sequential' under module_type (2642) for some reason. 18 unique sequential modules that appear in m do not appear in a. These would lack the first_attempted and first_attempted_timestamp features and likely should be excluded
+# 3) earned graded and possible graded = grade measurements for the assessments. A large part of assessments are not graded (0/0)
+table(a$possible_graded)
+# 4) first_attempted and first_attempted timestamp = time in UTC of when the student's first submission attempt
+# 5) other time variables are overlaps of variables mentioned in the tables above
+```
+
+# Create outcome variable 
+
+(deadline = 90th percentile of submissions. If a submission is later than 90th pct it is considered overdue. The outcome variable is_unsubmitted is binary: 0 = submitted ontime, 1 = overdue)
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+options(dplyr.summarise.inform = FALSE)
+
+ma = m %>% left_join(
+    a %>% select(hash_id:possible_graded, first_attempted_timestamp), 
+    by = c("hash_id"="hash_id", "module_id"="usage_key")
+)
+
+# Only sequential modules have a grade associated with them
+table(ma$module_type, ma$first_attempted_timestamp>0)
+
+# We see that assignments were due (submitted) at different times
+boxplot(ma$first_attempted_timestamp ~ ma$module_id)
+
+graded_assignment = ma %>% 
+    filter(possible_graded > 0) %>%
+    group_by(module_id) %>% 
+    summarise(
+        deadline = quantile(first_attempted_timestamp, probs = .9, na.rm=T),
+        p_unsubmitted = mean(is.na(first_attempted_timestamp))
+    ) %>% 
+    arrange(deadline)
+
+overdue_assignment = subset(graded_assignment, p_unsubmitted < 0.5)
+# Creating outcome: hash_id, order tracker, and outcome label
+outcome = overdue_assignment %>% left_join(
+    ma %>% select(module_id, hash_id, first_attempted_timestamp),
+    by = "module_id"
+)
+
+## Removing modules not associated with a hash_id. They're not assigned to any students so it would be impossible for them to receive subimissions
+outcome = outcome[!is.na(outcome$hash_id),]
+
+## Attaching outcome label
+outcome = data.frame(hash_id = outcome$hash_id,
+                     module_id = outcome$module_id, 
+                     deadline = outcome$deadline,
+                     is_unsubmitted = ifelse(is.na(outcome$first_attempted_timestamp), 1, 0))
+
+## there are 13 unique modules and deadlines
+length(unique(outcome$deadline)) == c(length(unique(outcome$module_id)),13)
+
+## The differences in time between each deadlines in order vary very wildly, indicating the assessments probably aren't cyclical versions of one another
+hist(unique(outcome$deadline)[c(13:2)]-unique(outcome$deadline)[12:1], main="Distribution of Deadline Differences", xlab="Timestamp")
+```
+
+## Instead of tracking module_id and deadline, replace with a variable that tracks each unique assessment's order by deadline
+
+```{r}
+module_order = suppressWarnings(sapply(outcome$deadline, function(x) { return(which(unique(outcome$deadline)==x)) }))
+outcome = data.frame(hash_id = outcome$hash_id, 
+                     module_order = module_order,
+                     is_unsubmitted = outcome$is_unsubmitted)
+
+## The expected # entries for this df should be n_students*n_targeted_a = 95*13 = 1235. It is currently missing 16 entries due to some assessments not being assigned to all 95 students. Even if these students have clickstream and module interaction data in the mean time, it will be impossible for them to have a submission for the assessment in the outcome
+table(outcome$module_order)
+
+## count an unassigned assessment as an unsubmitted one. Filling in the missing data with is_unsubmitted = 1 and respective order
+### Identifying missing modules
+missing_modules = setNames(aggregate(outcome$module_order, list(outcome$hash_id), function(x) { 
+  if (length(setdiff(c(1:13),c(x))) == 0 ) { return(NA) }
+  else { return(setdiff(c(1:13),c(x)))  }
+  }), c("hash_id","module_order"))
+missing_modules = missing_modules[!is.na(missing_modules$module_order),]
+missing_modules = unnest(missing_modules, module_order)
+missing_modules[,"is_unsubmitted"] <- 1
+outcome = rbind(outcome, missing_modules)
+
+## reorder by hash_id, then module_order
+outcome = outcome %>% arrange(hash_id, module_order)
+## check if ordered correctly
+sum(outcome$module_order==rep(1:13,times=95))==1235
+```
+
+# Data preprocesing and feature engineering
+
+```{r}
+secs_day = 60 * 60 * 24
+# Cleaning datasets
+## ma: only entries with associated hash_id and relevant variables. Also change NULL grades to NA, and convert values in grade and max_grade into integers
+ma_sub = ma[!is.na(ma$hash_id),] %>% select(hash_id, module_type, first_attempted_timestamp, created_timestamp, modified_timestamp, grade, max_grade, earned_graded, possible_graded)
+ma_sub$grade <- as.integer(na_if(ma_sub$grade,"NULL"))
+ma_sub$max_grade <- as.integer(na_if(ma_sub$max_grade,"NULL"))
+## cl: only entires with associated hash_id, timestamps before the last deadline, and relevant variables
+cl_sub = cl[!is.na(cl$hash_id),] %>% select(hash_id, event_type, event_source, timestamp)
+### entries with timestamp > 24 hours before the last deadline are excluded as they cannot be used for any of the assessments
+day_before_deadline = overdue_assignment$deadline-secs_day
+cl_sub = cl_sub[cl_sub$timestamp<max(day_before_deadline),]
+
+# initializng df for features from ma_sub (constrained by modified_timestamp)
+ma_features = data.frame(hash_id = character(),
+                         module_order = numeric(),
+                         num_chapter = numeric(),
+                         num_course = numeric(),
+                         num_openassessment = numeric(),
+                         num_problem = numeric(),
+                         num_sequential = numeric(),
+                         num_video = numeric(),
+                         problem_performance = numeric(),
+                         sequential_performance = numeric(),
+                         time_total = numeric()
+                        )
+## generating module features
+for (i in 1:length(day_before_deadline)) {
+  timed_ma = ma_sub %>% 
+    filter(modified_timestamp<day_before_deadline[i]) %>%
+    group_by(hash_id) %>%
+    summarise(
+      module_order = i,
+      num_chapter = sum(module_type=="chapter"),
+      num_course = sum(module_type=="course"),
+      num_openassessment = sum(module_type=="openassessment"),
+      num_problem = sum(module_type=="problem"),
+      num_sequential = sum(module_type=="sequential"),
+      num_video = sum(module_type=="video"),
+      problem_performance = sum(grade, na.rm=TRUE)/sum(max_grade, na.rm=TRUE),
+      sequential_performance = sum(earned_graded, na.rm=TRUE)/sum(possible_graded, na.rm=TRUE),
+      time_total = sum(modified_timestamp)-sum(created_timestamp)
+    )
+  ma_features = rbind(ma_features, timed_ma)
+}
+## of the 95, 16 students do not have any module activity prior to the first deadline. Among these 16, 7 further do not have activities prior to both the second and third deadline. Of them, 1 doesn't have any activties prior to both the fourth and fifth deadline. An explanation could be that they enrolled in the class late. This causes the cl_features df to have a few less entries than the expected 1235
+table(ma_features$module_order)
+## We'll treat missing module entries as having 0 values for all of the ma features. When merged with outcome labels, this might cause some students to have no module data for these earlier assessments but still submitted the assignment anyways. Filling in the missing data
+missing_modules = setNames(aggregate(ma_features$module_order, list(ma_features$hash_id), function(x) { 
+  if (length(setdiff(c(1:13),c(x))) == 0 ) { return(NA) }
+  else { return(setdiff(c(1:13),c(x)))  }
+  }), c("hash_id","module_order"))
+missing_modules = missing_modules[!is.na(missing_modules$module_order),]
+missing_modules = unnest(missing_modules, module_order)
+missing_modules[,names(ma_features)[3:length(ma_features)]] <- 0
+ma_features = rbind(ma_features, missing_modules)
+## reorder by hash_id, then module_order
+ma_features = ma_features %>% arrange(hash_id, module_order)
+## check if ordered correctly
+sum(ma_features$module_order==rep(1:13,times=95))==1235
+sum(ma_features$hash_id==outcome$hash_id)==1235
+## Check for possible NaNs in features where division was involved. NaN value here would represent a 0/0 division where all the student have not attempted any graded problem/sequential modules (max_grade or possible_graded > 0). Since this edge case occurs infrequently and given that most students score in the range of 90% or above, we'll slightly over-correct and give everyone a 100% completion grade for simplicity
+sum(is.nan(ma_features$sequential_performance))
+sum(is.nan(ma_features$problem_performance))
+ma_features$problem_performance[is.nan(ma_features$problem_performance)] <- 1
+ma_features$sequential_performance[is.nan(ma_features$sequential_performance)] <- 1
+
+# initializing df for features from cl_sub (constrained by timestamp)
+cl_features = data.frame(hash_id = character(),
+                         module_order = numeric(),
+                         num_events = numeric(),
+                         num_seq_goto = numeric(),
+                         num_seq_next = numeric(),
+                         num_seq_prev = numeric(),
+                         num_play = numeric(),
+                         num_speed_change = numeric(),
+                         num_seek = numeric(),
+                         num_pause = numeric(),
+                         num_links_clicked = numeric(),
+                         num_problem_graded = numeric(),
+                         num_dashboard_visits = numeric(),
+                         num_uploaded = numeric()
+                        )
+## generating clickstream features
+for (i in 1:length(day_before_deadline)) {
+  timed_cl = cl_sub %>% 
+    filter(timestamp<day_before_deadline[i]) %>%
+    group_by(hash_id) %>%
+    summarise(
+      module_order = i,
+      num_events = n(),
+      num_seq_goto = sum(event_type=="seq_goto"),
+      num_seq_next = sum(event_type=="seq_next"),
+      num_seq_prev = sum(event_type=="seq_prev"),
+      num_play = sum(event_type=="play_video"),
+      num_speed_change = sum(event_type=="speed_change_video"),
+      num_seek = sum(event_type=="seek_video"),
+      num_pause = sum(event_type=="pause_video"),
+      num_links_clicked = sum(event_type=="edx.ui.lms.link_clicked"),
+      num_problem_graded = sum(event_type=="problem_graded"),
+      num_dashboard_visits = sum(event_type=="edx.bi.course.upgrade.sidebarupsell.displayed"),
+      num_uploaded = sum(event_type=="openassessment.upload_file") 
+      )
+  cl_features = rbind(cl_features, timed_cl)
+}
+## Similar to above, of the 95, 7 students do not have any clickstream activity prior to the first deadline. Among these 7, 3 further do not have activities prior to both the second and third deadline.
+table(cl_features$module_order)
+## Similarly, we'll treat missing clickstream entries as having 0 values for all of the clickstream features. Filling in the missing data
+missing_clicks = setNames(aggregate(cl_features$module_order, list(cl_features$hash_id), function(x) { 
+  if (length(setdiff(c(1:13),c(x))) == 0 ) { return(NA) }
+  else { return(setdiff(c(1:13),c(x)))  }
+  }), c("hash_id","module_order"))
+missing_clicks = missing_clicks[!is.na(missing_clicks$module_order),]
+missing_clicks = unnest(missing_clicks, module_order)
+missing_clicks[,names(cl_features)[3:length(cl_features)]] <- 0
+cl_features = rbind(cl_features, missing_clicks)
+cl_features = cl_features %>% arrange(hash_id)
+## reorder by hash_id, then module_order
+cl_features = cl_features %>% arrange(hash_id, module_order)
+## check if ordered correctly
+sum(cl_features$module_order==rep(1:13,times=95))==1235
+sum(cl_features$hash_id==outcome$hash_id)==1235
+
+# Creating feature and combined dfs. Note that module_order can also be a viable feature as the timing of deadline (for example, early/mid/late into the semester) can influence p_unsubmitted
+features = cbind(ma_features, cl_features[,3:length(cl_features)])
+combined = features
+combined["is_unsubmitted"] <- outcome$is_unsubmitted
+## Features = columns inbetween the first and last
+## Label = last column
+head(combined)
+```
+
+# Feature correlation analysis
+
+```{r}
+## Correlation matrices
+cor(combined[,2:(length(combined)-1)], combined$is_unsubmitted)
+# cor(combined[,2:(length(combined)-1)])
+sort(abs(cor(combined[,2:(length(combined)-1)], combined$is_unsubmitted)))
+```
+
+# Train/test split
+
+```{r}
+## We'll use assessments 1-9 as the train set, and 10-13 as the test set
+sort(unique(combined$module_order), decreasing=TRUE)[1:4]
+
+# Split the dataset into train and test based on the module_ids or periods
+test = combined[combined$module_order>=10,]
+train = combined[combined$module_order<=9,]
+```
+
+# Training
+
+```{r}
+library(class)
+library(rpart)
+library(e1071)
+library(randomForest)
+# List feature variables
+feature_vars = names(combined)[2:(length(combined)-1)]
+
+# Fit  model to training data
+## Logistic Regression
+m_logreg = glm(paste("is_unsubmitted~", paste(feature_vars,collapse="+")), data=train,family="binomial")
+## KNN
+m_knn = knn(train = train[feature_vars], test = train[feature_vars], cl = train$is_unsubmitted, k = 3)
+## Classification Tree (unpruned since pruned is just a root)
+m_class_tree = rpart(paste("is_unsubmitted~", paste(feature_vars,collapse="+")), data=train, method="class")
+#cp_class_tree = m_class_tree$cptable[which.min(m_class_tree$cptable[,"xerror"]),"CP"]
+#m_class_tree_pruned = prune(m_class_tree, cp = cp_class_tree)
+## Random Forest
+rf_train = train
+rf_train$is_unsubmitted = as.factor(rf_train$is_unsubmitted)
+m_rf = randomForest(formula(paste("is_unsubmitted~", paste(feature_vars,collapse="+"))), data=rf_train, ntree=500, importance=TRUE)
+
+# Get predictions
+## Logistic Regression
+p_logreg_train = predict(m_logreg, newdata=train, type="response")
+p_logreg_train = (p_logreg_train>0.5)
+## KNN
+p_knn_train = m_knn
+## Classification Tree
+p_class_tree_train = predict(m_class_tree, newdata=train, type="class")
+## Random Forest
+p_rf_train = predict(m_rf, train)
+
+# Compute accuracy, recall, precision, and F1
+cm_logreg_train = table(true = train$is_unsubmitted, predicted = p_logreg_train)
+cm_knn_train = table(true = train$is_unsubmitted, predicted = p_knn_train)
+cm_class_tree_train = table(true = train$is_unsubmitted, predicted = p_class_tree_train)
+cm_rf_train = table(true = train$is_unsubmitted, predicted = p_rf_train)
+
+# F1 = 2 / (1/recall + 1/precision)
+compute_F1 <- function(cm) {
+  pred = as.vector(cm)
+  recall = pred[4]/(pred[4]+pred[2])
+  precision = pred[4]/(pred[4]+pred[3])
+  F1 = 2/((1/recall) + (1/precision))
+  return(F1)
+}
+
+# Training F1 score is ...
+compute_F1(cm_logreg_train)
+compute_F1(cm_knn_train)
+compute_F1(cm_class_tree_train)
+compute_F1(cm_rf_train)
+```
+
+# Testing
+
+```{r}
+# Make predictions on the test dataset
+## Logistic Regression
+p_logreg_test = predict(m_logreg, newdata=test, type="response")
+p_logreg_test = (p_logreg_test>0.5)
+## KNN
+p_knn_test = knn(train = train[feature_vars], test = test[feature_vars], cl = train$is_unsubmitted, k = 3)
+## Classification Tree
+p_class_tree_test = predict(m_class_tree, newdata=test, type="class")
+## Random Forest
+p_rf_test = predict(m_rf, test)
+
+# Compute F1
+cm_logreg_test = table(true = test$is_unsubmitted, predicted = p_logreg_test)
+cm_knn_test = table(true = test$is_unsubmitted, predicted = p_knn_test)
+cm_class_tree_test = table(true = test$is_unsubmitted, predicted = p_class_tree_test)
+cm_rf_test = table(true = test$is_unsubmitted, predicted = p_rf_test)
+
+# Testing F1 score is ...
+compute_F1(cm_logreg_test)
+compute_F1(cm_knn_test)
+compute_F1(cm_class_tree_test)
+compute_F1(cm_rf_test)
+
+```
